@@ -1,6 +1,6 @@
 import requests
 import json
-
+import datetime
 
 # Wikipedia's search/extract endpoint
 action_api = "https://en.wikipedia.org/w/api.php"
@@ -39,7 +39,7 @@ def plan_queries(topic):
     messages.append({"role": "user", "content": f"Topic: {topic}"})
     payload = {"model": "llama3.2",
             "messages": messages,
-            "format": "json", # force valid JSON output
+            "format": "json",
             "stream": False, # one complete reply, not chunks
             "options": {"temperature": 0, "num_ctx": 8192}} # temp 0 = repeatable; num_ctx = context size
     try:
@@ -59,6 +59,52 @@ def plan_queries(topic):
         print("Unable to fetch the response: ", error)
         return [topic] # Ollama not running / timed out -> use the plain topic
 
+# Chain step 4: turn the key points into a Markdown report, add sources, save to a file
+def write_report(topic, key_points, articles):
+    # Tell the model to use ONLY the given points; sources are added by code below, so the model can't invent them
+    system_prompt = 'You write short research reports. You are given a topic and key points. Write a Markdown report with a # title, a ## Summary of 2-3 sentences, and a ## Key points section listing the given points. Use only the given points. Do not add facts or sources.'
+    # Turn the list of key points into one text block, one "- point" per line
+    points_text = ""
+    for point in key_points:
+        points_text += f"- {point}\n"
+    # The Sources section is built from the real article titles, not by the LLM
+    sources = "\n\n## Sources\n"
+    for art in articles:
+        # Wikipedia URL for each article: spaces in the title become underscores
+        link = f"https://en.wikipedia.org/wiki/{art['title'].replace(' ','_')}"
+        # Add one Markdown link line per article (must sit inside the loop)
+        sources += f"- [{art['title']}]({link})\n"
+    messages = []
+    messages.append({"role": "system", "content": system_prompt})
+    # Label the key points clearly so the small model uses them as given
+    messages.append({"role": "user", "content": f"Topic: {topic}\n\nKey Points: \n{points_text}"})
+    # No "format": "json" here: we want plain Markdown text back, not JSON
+    payload = {"model": "llama3.2",
+            "messages": messages,
+            "stream": False,
+            "options": {"temperature": 0, "num_ctx": 8192}}
+    try:
+        response = requests.post("http://localhost:11434/api/chat", json=payload, timeout=180)
+        response.raise_for_status()
+        # The reply is plain markdown text
+        report = response.json()["message"]["content"]
+        # LLM-written report + code-built sources = final report text
+        full_report = report + sources
+        # Today's date as text, e.g. 2026-11-27, for the filename
+        date = str(datetime.date.today())
+        # Filename-safe topic: lowercase, spaces become dashes
+        slug = topic.lower().replace(' ','-')
+        filename = f"{date}-{slug}-report.md"
+        # "w" creates the file (or overwrites an existing one); utf-8 keeps special characters intact
+        with open(filename,"w",encoding="utf-8") as f:
+            f.write(full_report)
+        print(f"Saved: {filename}")
+        return full_report
+    except KeyError as error2:
+        print(f"Invalid JSON Key: {error2}") # expected key missing from the reply
+    except requests.exceptions.RequestException as error:
+        print("Unable to fetch the response: ", error) # network / Ollama problem
+        return
 
 def summarize(topic, articles):
     system_prompt = 'Extract 5 to 8 key points about the topic from the extracts. Each point is one short sentence. Return JSON: {"key_points": [...]}. Use only the extracts.'
@@ -120,6 +166,7 @@ def main():
     result = summarize(query, all_articles)
     if result is not None:
         print(json.dumps(result, indent=2)) # indent=2 makes the JSON readable
+        write_report(query, result.get("key_points", []), all_articles) # Chain step 4: write the report; .get(..., []) gives an empty list instead of crashing if the key is missing
     else:
         print("No data available.")
 
